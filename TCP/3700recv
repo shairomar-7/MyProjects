@@ -1,0 +1,157 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, hashlib, zlib, base64
+
+class Receiver:
+    """
+    This Receiver follows the semantics of TCP Reno.
+    It prints out the received data to STDOUT in order and without errors.
+    The receiver keeps track of the next_seq_num is expects. If it receives
+    out of order packets with a sequence number greater than next_seq_num,
+    those packets are buffered into the Map<int, Dict> received_packets, which
+    maps sequence number to packets received. 
+    """
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+        self.remote_host = None
+        self.remote_port = None
+        self.next_seq_num = 1
+        self.received_packets = {}
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send_ack(self, seq_num):
+        """
+        Sends the constructed ACK packet to the sender, with the given seq num.
+
+        Args:
+            seq_num(int) -> the sequence number to be inserted into the packet.
+        """
+        self.send({"type": "ack", "SN": seq_num})
+
+    def decompress_data(self, packet):
+        """
+        Decompresses the given packet's data and returns it.
+
+        Args:
+            packet(Dict) -> data packet sent by the sender containing compressed data.
+        """
+        return zlib.decompress(base64.b64decode(packet["data"])).decode('utf-8')
+
+    def process_buffer(self):
+        """
+        Processes all the consecutive and in order packets in the received_packets Map.
+        Keeps looping as long as the next_seq_num is in the Map. Pop the packet with the
+        next_seq_num from the Map, print it to STDOUT and increment the next_seq_num.
+        Once the loop ends, we send an ack to the last acked seq_num (ie, next_seq_num - 1).
+        """
+        while self.next_seq_num in self.received_packets:
+            packet = self.received_packets.pop(self.next_seq_num)
+            print(self.decompress_data(packet), end='', flush=True)
+            self.next_seq_num += 1
+        self.send_ack(self.next_seq_num - 1)
+    
+    def process_packet(self, message):
+        """
+        Processes the given packet based on it's sequence number.
+        If the sequence number of the packet equals the next_seq_num we expect,
+        then add it to the received_packets Map, and process the buffer. 
+        Else if, the seq num of the packet is greater than next_seq_num:
+        if the seq num is in the received_packets Map, just process the buffer,
+        and else, add the packet to the Map, and send an acknowledgement to the last
+        acked packet.
+        Finally, if the sequence number of the packet received is less than next_seq_num,
+        then we send an ack for the last acked packet.
+
+        Args:
+            message(Dict) -> the data packet sent by the sender and received by the receiver.
+        """
+        if message["SN"] == self.next_seq_num:
+            self.received_packets[message["SN"]] = message
+            self.process_buffer()
+        elif message["SN"] > self.next_seq_num:
+            if message["SN"] in self.received_packets:
+                self.process_buffer()
+            else:
+                self.received_packets[message["SN"]] = message
+                self.send_ack(self.next_seq_num - 1)
+        else:
+            self.send_ack(self.next_seq_num - 1)
+        return True
+
+    
+    def check_integrity(self, message):
+        """
+        Checks the integrity of the data in the given data packet by 
+        recomputing it's hash value, and comparing the hash. If the hash 
+        is equal, than the data has not been corrupted, if not, the data has
+        been corrupted.
+
+        Args:
+            message(Dict) -> the data packet received
+        
+        Returns:
+            bool -> indicating whether the packet's data has been corrupted.
+        """
+        dataInBytes = str.encode(self.decompress_data(message))
+        receivedHash = message["hash"]
+        actualHash = hashlib.sha1(dataInBytes).hexdigest()
+        return actualHash == receivedHash
+
+    def acknowledge(self, message):
+        """
+        Acknowledges the given data packet received.
+        If the data packet is corrupt, then we just send an ack for the
+        last acked packet. If not, we process the packet. 
+
+        Args:
+            message(Dict) -> the data packet received and sent by the sender
+        """
+        if self.check_integrity(message):
+            self.process_packet(message)
+        else:
+            self.send_ack(self.next_seq_num - 1)
+    
+    def receive_data(self, conn):
+        """
+        Function receives data from the sender, through the given socket.
+        It reads the data from the socket, and tries to deserialize the packet
+        If an exception occurs, the packet is assumed to be corrupt and is ignored,
+        and if no exception occurs, we acknowledge the data packet received.
+
+        Args:
+            conn(Socket) -> socket to be read from
+        """
+        data, addr = conn.recvfrom(65535)
+        if self.remote_host is None:
+            self.remote_host = addr[0]
+            self.remote_port = addr[1]
+        try:
+            msg = json.loads(data.decode('utf-8'))
+            self.acknowledge(msg)
+        except:
+            return
+
+    def run(self):
+        """
+        Keeps looping and trying to read data sent by the sender in
+        an event driven style.
+        """
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                self.receive_data(conn)
+        
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

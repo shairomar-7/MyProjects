@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+import argparse
+import socket
+from urllib.parse import urlparse
+import os
+
+class FTPData:
+    """FTPData class represents all the required data to run an FTP client-server program
+    host -> String representing the host to connect to
+    path -> String reprenting the path of the FTP server's File System
+    operation -> String representing the operation to be done (ls, rm, mkdir, rmdir, cp, mv)
+    user -> String representing the username of the client (to log in to the server) (default anonymous)
+    password -> String representing the password of the client (to log in to sever)
+    port -> int represents the port number of the server to connect our socket to (default 21)
+    dataChannel -> socket allowing for the transfer of data (such as file contents) from and to server
+    controlChannel -> socket allowing sending and receiving requests (FTP commands) and responses
+    localFilePath -> String representing the local file path, if given in cmd line arguments
+    serverURL -> String representing the server's full url
+    moveToServer -> Boolean informing whether we are moving/copying a file to/from the server(default false)"""
+    def __init__(self):
+        self.host = None
+        self.path = None
+        self.operation = None
+        self.user = "anonymous"
+        self.password = None
+        self.port = 21
+        self.dataChannel = None
+        self.controlChannel = None
+        self.localFilePath = None
+        self.serverURL = None
+        self.moveToServer = False
+
+# Global variable/constant
+FTPDATA = FTPData()
+URLS = None
+
+# Parses the command line arguments and sets the operation and urls global variables
+# CMD-Line-Args: ./3700ftp operation params [params...]
+# operation is required, and params is also required. [params...] is not required and depends on operation.
+def parse_args():
+    global URLS
+    parser = argparse.ArgumentParser()
+    parser.add_argument('operation', type= str)
+    parser.add_argument('params', metavar='params', type=str, nargs='+')
+    args = parser.parse_args()
+    FTPDATA.operation = args.operation
+    URLS = args.params
+
+# Returns whether the server url is none..
+def validate_ls_mkdir_rmdir_rm():
+    return FTPDATA.serverURL == None
+
+# Returns whether the local file or server url is null/none
+def validate_cp_mv_args():
+    return FTPDATA.localFilePath == None or validate_ls_mkdir_rmdir_rm()
+
+# Validates the arguments: operation have to be one of: cp, mv, ls, mkdir, rmdir, or rm
+# if operation is cp/mv: expect 2 urls and check that one is URL and other is local file
+# if operation is ls, mkdir, rmdir, or rm: then we expect one argument, the server URL
+# If these conditions are not met, then an Exception is thrown to indicate the issue.
+def validate_args():
+    op = FTPDATA.operation
+    if (op == "cp" or op == "mv"):
+        if len(URLS) != 2 or validate_cp_mv_args(): 
+            raise Exception("Operations cp and mv expect 1 URL and 1 local file path!")
+    elif (op == "ls" or op == "mkdir" or op == "rmdir" or op == "rm"):
+        if len(URLS) != 1 or validate_ls_mkdir_rmdir_rm(): 
+            raise Exception("Operations ls, mkdir, rmdir, and rm expect 1 URL!")
+    else:
+        raise Exception("Unsupported operation given!")
+
+# Parses the url or the file and stores it in either serverURL or localFile (global vars)
+# If the url is a file -> store in localFile, otherwise, url is a server url -> store in serverURL
+# Throws an exception if the host or the path was not included in the given server url!
+def parse_url_file(url):
+    #global localFile, serverURL, USER, PASSWORD, HOST, PORT, PATH
+    url_parsed = urlparse(url)
+    if url_parsed.scheme in ('file', ''):
+        FTPDATA.localFilePath = url
+    else:
+        FTPDATA.serverURL = url
+        if not (url_parsed.username == None):
+            FTPDATA.user = url_parsed.username
+        FTPDATA.password = url_parsed.password
+        FTPDATA.host = url_parsed.hostname
+        if not url_parsed.port == None:
+            FTPDATA.port = url_parsed.port
+        FTPDATA.path = url_parsed.path
+        if (FTPDATA.host == None or FTPDATA.path == None):
+            raise Exception("Host and path must be given!")
+
+# Parses the url(s) given through commad line.
+# If two urls were given (if not, ): 
+# if the first is a file, then we are moving/copying to the server 
+# If the first is a url, we are moving/copying from the server to local file system.
+def parse_urls():
+    parse_url_file(URLS[0])
+    if len(URLS) == 2:
+        if (FTPDATA.serverURL == None):
+             FTPDATA.moveToServer = True 
+        parse_url_file(URLS[1])
+
+# Parses and validates the arguments given through command line!
+def parse_and_validate_args():
+    parse_args()
+    parse_urls()
+    validate_args()
+
+# Initializes the socket connection to the server with given HOST, and PORT (from cmd line arguments)
+# If no port is given, default is 21, and if no host is given, default is "anonymous"
+def init_connection():
+    FTPDATA.controlChannel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    FTPDATA.controlChannel.connect((FTPDATA.host, FTPDATA.port))
+
+# Sends the given message to the server through the given socket
+# The message will be appended with '\r\n' and encoded in utf-8 before sent
+# Throws an exception if the given message could not be sent to the server
+def encode_and_send(socket, message):
+  try:
+    message = message + '\r\n'
+    messageEncoded = message.encode("utf-8")
+    socket.send(messageEncoded)
+  except:
+    raise Exception("Encoded JSON message could not be sent to server!")
+
+# Receives a message from the server sent through the socket,
+# and returns the json decoded dictionary
+# Throws an exception if the message could not be received, or decoded.
+def receive_and_decode(socket):
+    data = socket.recv(4096)
+    while not (data.endswith(b'\n')):
+      data += socket.recv(1024)
+    return data.decode("utf-8")
+
+# Receives data from the data channel sent from the FTP server and returns the binary data
+# It will keep reading and appending to the buffer until the amount read is 0
+def receive(dataSock):
+    dataBinary = dataSock.recv(1024)
+    currRead = dataBinary
+    while not len(currRead) == 0:
+        currRead = dataSock.recv(1024)
+        dataBinary += currRead
+    return dataBinary
+
+# Initializes the commands:
+# loggin the user, setting the type to 8-bit binary, mode to stream mode, connection to file-oriented mode
+# If no USER was given, the user will be anonymous and sending PASS command for the password will be skipped.
+# If the server is unable to loggin the user (invalid user or pass), an exception is thrown to indicate so.
+def init_commands(socket):
+    response = receive_and_decode(socket)
+    encode_and_send(socket, "USER " + FTPDATA.user)
+    response = receive_and_decode(socket).split()
+    if response[0].startswith('3') and not FTPDATA.password == None:
+        passCommand = "PASS " + FTPDATA.password
+        encode_and_send(socket, passCommand)
+        response = receive_and_decode(socket).split()
+    if (response[0].startswith('4') or response[0].startswith('5') or response[0].startswith('6')):
+        raise Exception("Invalid user name or password")
+    encode_and_send(socket, "TYPE I")
+    response = receive_and_decode(socket)
+    encode_and_send(socket, "MODE S")
+    response = receive_and_decode(socket)
+    encode_and_send(socket, "STRU F")
+    response = receive_and_decode(socket)
+
+# Opens the data channel by sending PASV command to server, and if sever replies with success code 227:
+# We then move on to parsing the ip address, and the port number. 
+# If the server replies with error code, then an exception is thrown!
+def open_data_channel(sock):
+    encode_and_send(sock, "PASV")
+    response = receive_and_decode(sock).split()
+    if response[0] == "227":
+        ipStuff = response[-1].replace('(','').replace(')','').replace('.', '').split(',')
+        ip = '.'.join(ipStuff[:4])
+        port = (int(ipStuff[-2]) << 8) + int(ipStuff[-1])
+        FTPDATA.dataChannel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        FTPDATA.dataChannel.connect((ip, port))
+    else: 
+        raise Exception("Unable to open data channel!")
+
+# Function copies over files from the local file system to the sever or vice-versa
+# Throws an error if the file was not found!
+def cp_helper(socket):
+    open_data_channel(socket)
+    if FTPDATA.moveToServer:
+        with open(FTPDATA.localFilePath, "rb") as file:
+            buff = file.read()
+            encode_and_send(socket, "STOR " + FTPDATA.path)
+            print(receive_and_decode(socket))
+            FTPDATA.dataChannel.send(buff)
+            FTPDATA.dataChannel.close()
+    else:
+        encode_and_send(socket, "RETR " + FTPDATA.path)
+        response = receive_and_decode(socket).split()
+        if response[0].startswith("5"): 
+            raise Exception("File could not be found on server!")
+        buff = receive(FTPDATA.dataChannel)
+        with open(FTPDATA.localFilePath, "wb") as file:
+            file.write(buff)
+
+# Function moves a file from the local file system to the server or vice-versa
+# It will call the cp_helper function, as the mv operation is the cp + deleting the file to be moved
+# Throws an error if the file was not found!
+def mv_helper(socket):
+    cp_helper(socket)
+    if FTPDATA.moveToServer:
+        os.remove(FTPDATA.localFilePath)
+    else:
+        encode_and_send(socket, "DELE " + FTPDATA.path)
+        print(receive_and_decode(socket))
+
+# Processes the operation parsed from the command line arguments.
+# Operations could be: rmdir, mkdir, ls, rm, cp, mv.
+# rmdir and mkdir would send the FTP command: "RMD [path]" and "MKDR [path]" respectively
+# rm would send the FTP command: "DELE [path]"
+# ls would send the FTP command: "LIST [path]"
+# cp would send the FTP command: "STOR [path]" or "RETR [path]",
+# depending on whether we are copying to or from server
+# mv would send the same as cp command + it would either delete file in file system or server,
+# depending on wehther we are moving to (delete in FS) or from server (delete in server with "DELE" command)
+def process_commands(socket):
+    path = FTPDATA.path
+    op = FTPDATA.operation
+    if op == "rmdir":
+        encode_and_send(socket, "RMD " + path)
+        print(receive_and_decode(socket))
+    elif op == "mkdir":
+        encode_and_send(socket, "MKD " + path)
+        print(receive_and_decode(socket))
+    elif op =="ls":
+        open_data_channel(socket)
+        encode_and_send(socket, "LIST " + path)
+        print(receive_and_decode(socket))
+        print(receive(FTPDATA.dataChannel).decode("utf-8"))
+    elif op =="rm":
+        encode_and_send(socket, "DELE " + path)
+        print(receive_and_decode(socket))
+    elif op =="cp":
+        cp_helper(socket)
+    elif op =="mv":
+        mv_helper(socket)
+    encode_and_send(socket, "QUIT") 
+    print(receive_and_decode(socket))
+
+# First, we parse and validate the command line arguments
+parse_and_validate_args()
+
+# Second, we initialize the socket connection with the given host and port (host is required!)
+init_connection()
+
+# Then, we initialize the commands (login the user, set TYPE, MODE, STRU)
+init_commands(FTPDATA.controlChannel)
+
+# Finally, we process and execute the command that was given (ls, rm, rmdir, mkdir, mv, or cp)
+process_commands(FTPDATA.controlChannel) 
+
+# and close the socket connection
+FTPDATA.controlChannel.close()

@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+import argparse, socket, ssl, time, gzip, threading
+from collections import deque
+from html.parser import HTMLParser
+from urllib.parse import urlparse
+
+DEFAULT_SERVER = "proj5.3700.network"  
+DEFAULT_PORT = 443 
+CRLF = "\r\n"
+
+class Crawler:
+    """
+    This Crawler class is responsible for crawling the Fakebook website at the given server and port.
+    Starting at the root path, we collect all the hyperlinks found at the HTML page, and add them to a deque.
+    We delegate 5 of those hyperlinks each to one thread to increase the performance of the crawler with concurrency.
+    We keep track of the visited links in order not to revisit them and loop infinitely. 
+    The web crawler will store the secret flags hidden randomly in the website, and will end the program once 
+    all the 5 flags have been collected, and prints them to STDOUT.
+    """
+    def __init__(self, args):
+        """
+        Initializes this Crawler class by setting the server, port, username, and password given through args.
+        We set the sessionID to None, and initialize the socket connection, wrapped in TLS layer of security.
+        We also initalize the thread Lock, in order to make this program thread-safe.
+        We then login with the provided username and password to the website at the given server and port.
+
+        Args:
+            args(Namespace) -> object containing the cmd line arguments. 
+        
+        Returns:
+            Crawler -> object representing the web crawler for Fakebook.
+        """
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.sessionID = None
+        self.CSRF = None
+        self.socket = socket.create_connection((self.server, self.port))
+        self.socket.settimeout(45)
+        context = ssl.create_default_context()
+        self.socket = context.wrap_socket(self.socket, server_hostname = self.server)
+        self.lock = threading.Lock()
+        self.login()
+
+    def get_cookies(self):
+        """
+        Gets the cookies parsed by the HTTP response upon logging in.
+
+        Returns:
+            Dict -> representing the cookies parsed (could be sessionid and/or csrftoken)
+        """
+        cookies = {}
+        if self.sessionID != None:
+            cookies["sessionid"] = self.sessionID
+        if self.CSRF != None:
+            cookies["csrftoken"] = self.CSRF
+        return cookies
+
+    def get(self, url):
+        """ 
+        Sends a GET request to the server and returns the response for the request.
+        We first construct the GET request by adding the request and the headers,
+        including host, and both keep-alive and Accept-Encoding to increase the performance of the crawler.
+        We also include the cookies if the cookies have been parsed.
+        If the URL is invalid, ie the server name is not in the URL, an AssertionError is thrown.
+        Args:
+            url(string) -> website path of the next page to crawl
+        Returns:
+            Dict -> the response sent by the server, and parsed into a dictionary.
+        """
+        if self.server not in url:
+            raise AssertionError("Crawler should only traverse URLs that point to pages on " + self.server + CRLF + ", URL: " + str(url))
+        url = urlparse(url)
+        initialGetRequest = f"GET {url.path} HTTP/1.1{CRLF}"
+        hostHeaderHeader = f"Host: {url.netloc}{CRLF}"
+        keepAliveHeader = f"Connection: keep-alive{CRLF}"
+        acceptEncodingHeader = f"Accept-Encoding: gzip{CRLF}"
+        cookies = self.get_cookies()
+        if len(cookies) != 0:
+            cookies = '; '.join(f'{key}={value}' for key, value in cookies.items())
+            cookieHeader = f"Cookie: {cookies}{CRLF}"
+            getRequest = f"{initialGetRequest}{hostHeaderHeader}{cookieHeader}{acceptEncodingHeader}{CRLF}"
+        else:
+            getRequest = f"{initialGetRequest}{hostHeaderHeader}{keepAliveHeader}{acceptEncodingHeader}{CRLF}"
+        return self.send_request(getRequest)
+
+
+    def construct_post(self, url, content):
+        """
+        Constructs a POST HTTP request for the given url with the given content, and
+        returns the constructed POST request as a string. It will include the cookies,
+        if they have already been parsed already.
+
+        Args:
+            url(string) -> the absolute path of the next page to send the POST request to.
+            content(string) ->  the content to be sent in the body of the POST request.
+
+        Returns:
+            string -> the HTTP POST request including any headers and body. 
+        """
+        initialPostRequest = f"POST {url.path} HTTP/1.1{CRLF}"
+        hostHeader = f"Host: {url.netloc}{CRLF}"
+        contentTypeHeader = f"Content-Type: application/x-www-form-urlencoded{CRLF}"
+        contentLengthHeader = f"Content-Length: {len(content)}{CRLF}"
+        fromHeader = f"From: {self.username}@northeastern.edu{CRLF}"
+        user = f"User-Agent: cs3700-AliOmarCrawler/1.0{CRLF}"
+        keepAlive = f"Connection: keep-alive{CRLF}"
+        cookies = self.get_cookies()
+        if len(cookies) != 0:
+            cookies = '; '.join(f'{key}={value}' for key, value in cookies.items())
+            cookieHeader = f"Cookie: {cookies}{CRLF}"
+            postRequest = f"{initialPostRequest}{hostHeader}{contentTypeHeader}{contentLengthHeader}{keepAlive}{fromHeader}{user}{cookieHeader}{CRLF}{content}"
+        else:
+            postRequest = f"{initialPostRequest}{hostHeader}{contentLengthHeader}{contentTypeHeader}{keepAlive}{fromHeader}{user}{CRLF}{content}"
+        return postRequest
+
+    def post(self, url, content):
+        """
+        Sends a POST request to the url with the given content, and
+        returns the response sent by the server.
+
+        Args:
+            url(string) -> the absolute path of the next page to send the POST request to.
+            content(string) -> the content to be sent in the body of the POST request.
+        
+        Returns:
+            Dict -> the HTTP response to the POST sent by the server, and parsed into a dictionary.
+        """
+        if self.server not in url:
+            raise AssertionError("Crawler should only POST to pages on "+ self.server + CRLF)
+        url = urlparse(url)
+        request = self.construct_post(url, content)
+        return self.send_request(request)
+
+
+    def login(self):
+        """
+        Logs into the Fakebook website at the given server and port, and parses the cookies upon
+        receiving the response (of course, if the response is valid). The way we login is we first
+        send a get request for the login page, and then send a post giving the server the username
+        and password along with the csrf token. 
+        The login page is found at: "https://{self.server}:{self.port}/accounts/login/?next=/fakebook/"
+        """
+        loginURL = f"https://{self.server}:{self.port}/accounts/login/?next=/fakebook/"
+        response = self.get(loginURL)
+        for cookie in response["cookies"]:
+            if "csrftoken" in cookie:
+                self.CSRF = cookie.split("; ")[0].split("=")[1] 
+        if self.CSRF == None:
+            raise AssertionError("CSRF token not found" + CRLF)
+        loginCredentials = f"username={self.username}&password={self.password}&csrfmiddlewaretoken={self.CSRF}&next="
+        postResponse = self.post(loginURL, loginCredentials)
+        for cookie in postResponse["cookies"]:
+            if "sessionid" in cookie:
+                self.sessionID = cookie.split("; ")[0].split("=")[1]
+        if self.sessionID == None:
+            raise AssertionError("Session ID not found" + CRLF)
+
+    def get_response(self):
+        """
+        Gets the response for a POST or GET http 1.1 request.
+        The response is assumed to be received as one single chunk less than 8192 bytes.
+        Since the body might be compressed with GZIP, it couldn't be decoded with utf-8,
+        before being decompressed. And so, we split the header and body if we can,
+        and try to decode the header, and return a pair containing the decoded header, and 
+        the body as is (to be decompressed later). 
+        If an exception is thrown due to the split, then we decode the whole response, and
+        return the pair containing the decoded header, and none. If an exception is once again 
+        thrown, we return None to indicate that only the body has been received (common issue encountered).
+
+        Returns:
+            pair(string, bytes) -> the pair containing the decoded header, and the compressed body respectively. 
+        """
+        with self.lock:
+            data = self.socket.recv(8192)
+            try:
+                header,body = data.split(b'\r\n\r\n')
+                return (header.decode('utf-8'), body)
+            except:
+                try:
+                    return (data.decode(), None)
+                except:
+                    return None
+
+    def send_request(self, request):
+        """
+        Sends the given request to the server.
+        Before sending, we aquire the lock to avoid any IO races, and 
+        release it once finished. We then receive the response. If the
+        response is None, we resend the request. If the response is not null,
+        we seperate the header and the body, parse the header and body into 
+        a dictionary (for ease of access). If the parsed response is null, we
+        resend the request. If not, we return it. 
+
+        Args:
+            request(string) -> the HTTP request to be sent to the server.
+
+        Returns:
+            Dict -> the parsed HTTP response sent by the server upon receiving and processing
+            our request. 
+        """
+        with self.lock:
+            self.socket.send(request.encode())
+        response = self.get_response()
+        if response != None:
+            response_header, response_body = response
+            parsed_response = self.parse_HTML_response(response_header, response_body)
+            if parsed_response == None:
+                return self.send_request(request)
+            else:
+                return parsed_response
+        else:
+            return self.send_request(request)
+
+    def decompress_body(self, response_header, response_body):
+        """
+        Decompresses the HTTP response's body with gzip and returns the body.
+
+        Args:
+            response_header(Dict) -> the HTTP headers of the response.  
+            response_body(bytes) -> the compressed body of the HTTP response
+
+        Returns:
+            string -> the gzip decompressed HTTP response's body.
+        """
+        body = response_body
+        if response_body and "Content-Encoding" in response_header["headers"]: 
+            body = gzip.decompress(response_body).decode('utf-8')
+        return body
+
+    def parse_HTML_response(self, response_header, response_body):
+        """
+        Parses the given HTTP response's body, which is typically HTML.
+        The HTML is the response's body defines the content of a web page.
+        Basically, what we're doing here is parsing the string, and 
+        storing the headers and body into a dictionary for ease of access.
+
+        Args:
+            response_header(string) -> represents the HTTP response header sent by the server
+            response_body(bytes) -> represents the compressed HTML body of the HTTP response.
+
+        Returns:
+            Dict -> dictionary representing the parsed HTTP response headers and body.
+            The parsedData will have a "headers" and "body". The value of "headers" will be a dictionary,
+            and the value of "body" will be a string.
+        """
+        parsedData = {}
+        parsedData["headers"] = {}
+        parsedData["cookies"] = []
+        info = response_header.split(CRLF)
+        headers = info[1:]
+        try:
+            status = int(info[0].split(" ")[1])
+        except:
+            return None
+        parsedData["status"] = status
+        for header in headers:
+            (k, v) = header.split(": ")
+            if k == "Set-Cookie":
+                parsedData["cookies"].append(v)
+            else:
+                parsedData["headers"][k] = v
+        parsedData["body"] = self.decompress_body(parsedData, response_body)
+        return parsedData
+
+    def process_response(self, frontier, visited, path, flags):
+        """
+        Processes the response as a result of requesting some resource from the server,
+        and will update the frontier, visited, and flags upon processing a response.
+        This function will handle the different status codes of the HTTP response.
+        First, we add to the set of visited URLs "nextPath", which is the url we are currently processing.
+        If status is 200, then the response is OK, we process the response and it's body's, parse all the hyperlinks,
+        and add them to the frontier (if the URL was not visited and is not one of the items in frontier). We add any
+        flags found to the list of flags, and exit. If the status is 302, then we are being redirected to a different URL,
+        and so we add that to the frontier at the front of the deque. If the status is 403 or 404, we pass, and if the
+        status is 503 we just add the nextPath back to the frontier for a retrial. If the status is anything other than those,
+        we raise an Exception.
+
+        Args:
+            frontier(Deque) -> represents the deque of URLs to be visited in order to fully crawl Fakebook
+            visited(Set) -> represents the set of visited URLs so far, in order to avoid loops.
+            path(string) -> the current path to which we are crawling for secret flags (popped from frontier).
+            flags(List) -> the list of flags that have been caught so far crawling Fakebook
+        """
+        response = self.get(path)
+        status = response["status"]
+        with self.lock:
+            visited.add(path)
+            if status == 200:
+                fakeboookParser = Parser()
+                body = response["body"]
+                if body:
+                    fakeboookParser.feed(body)
+                allLinks = fakeboookParser.linkList
+                fakebookLinks = []
+                for link in allLinks:
+                    if "/fakebook/" in link:
+                        fakebookLinks.append(link)
+                for link in fakebookLinks:
+                    url = f"http://{self.server}{link}"
+                    if url not in visited and url not in frontier:
+                        frontier.append(url)
+                flags.extend(fakeboookParser.flags)
+            elif status == 302:
+                redirectURL = response["headers"]["Location"]
+                frontier.appendleft(redirectURL)
+            elif status == 403 or status == 404:
+                pass
+            elif status == 503:
+                frontier.append(path)
+            else:
+                raise Exception(f"Can't recognize status of: {status}")
+
+    def thread_handler(self, frontier, visited, flags):
+        """
+        Creates and joins 5 threads at maximum. Each thread will handle the next path in the 
+        deque frontier (pop left). We create a new thread with the target function being process_response.
+        We pass along the frontier, visited, flags along with the nextPath as arguments to the target func.
+        We add the thread to the list, and start it. This is all IF there are any items in the frontier to be popped.
+        Then, we join each thread that was created and wait for all of them to terminate their process.
+
+        Args:
+            frontier(Deque) -> represents the deque of URLs to be visited in order to fully crawl Fakebook
+            visited(Set) -> represents the set of visited URLs so far, in order to avoid loops.
+            flags(List) -> the list of flags that have been caught so far crawling Fakebook     
+
+        Returns:
+            int -> 1 if the 5 flags have been found, and none otherwise.
+        """
+        threads = []
+        for i in range(5):
+            if len(flags) >= 5:
+                return 1
+            if len(frontier) > 0:
+                nextPath = frontier.popleft()
+                t = threading.Thread(target=self.process_response, args=(frontier, visited, nextPath, flags))
+                threads.append(t)
+                t.start()
+            else:
+                break
+        for t in threads:
+            t.join()
+
+    def run(self):
+        """
+        Runs the Crawler on the given server/port.
+        Initiate the flags, and assume the rootPath is at http://[server]/fakebook/.
+        We initiate the frontier (Deque), and the visited(set) urls so far. We add the rootPath
+        to the deque to be processed in the while loop. We create call the thread_handler function
+        to create 5 threads at a time for better crawling performance. If the thread_handler returned 1,
+        then we know the 5 flags have been found. We break, and return the flags to be printed.
+
+        Returns:
+            List<int> -> the 5 secret flags hidden in the Fakeboook website.
+        """
+        flags = []
+        rootPath = f"http://{self.server}/fakebook/"
+        frontier = deque()
+        frontier.append(rootPath)
+        visited = set()
+        while len(frontier) > 0:
+            if self.thread_handler(frontier, visited, flags) == 1:
+                break
+        return flags
+
+# Parser to find links and flags
+class Parser(HTMLParser):
+    def __init__(self):
+        HTMLParser.__init__(self)
+        self.linkList = []
+        self.flags = []
+
+    # Find and store flags
+    def handle_data(self, data):
+        if "FLAG: " in data:
+            flag = data.split(": ")[1]
+            self.flags.append(flag)
+
+    # Find potential links to traverse
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+             for k, v in attrs:
+                 if k == "href":
+                     self.linkList.append(v)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to run")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    flags = sender.run()
+    for flag in flags:
+       print(flag)

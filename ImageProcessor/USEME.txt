@@ -1,0 +1,59 @@
+*NOTE: If you have any difficulty running the jar file, please contact us.
+In order to run the program:
+
+navigate to res directory
+run:
+java -jar ImageProcessor.jar -text (text UI)
+java -jar ImageProcessor.jar (GUI)
+java -jar ImageProcessor.jar [scriptFilePath]  (text UI scriptfile)
+java -jar ImageProcessor.jar [scriptFilePath] -masked (masked text UI scriptfile)
+java -jar ImageProcessor.jar -masked (masked text ui)
+
+The final two command line arguments are only there so that we could create the masked version of an image. Any other command line argument is invalid and will throw an error. If you want to run the actual script file that we wrote, replace the text in square brackets with script.txt.
+
+
+
+Possible commands for the program (TEXT-BASED UI):
+
+Note: phrases in brackets represent strings that depend on user input. In this case, these are the file path
+of the image that the user wants to modify, the name of the image in the user’s computer, and the name that a new image will be stored under. A file path is only valid if it ends in one of: .ppm, .bmp, .jpg, .jpeg, or .png.
+There is also one case for the brighten operation where the user has to input the increment for how much they want to brighten the image. This value has to be an int.
+
+- “load [file-path] [destination-name]” -> allows a user to load an image
+- “save file [file-path] [destination-name]” -> allows a user to save an image
+
+- “flip-horizontal [image-name] [destination-name]” -> allows a user to flip an image horizontally
+
+- “flip-vertical  [image-name]  [destination-name]” -> allows a user to flip an image vertically
+
+- “brighten [increment] [image-name] [destination-name]” -> allows a user to brighten/darken an image by a given increment
+
+- “red-component [image-name]  [destination-name]” -> allows a user to visualize an image where each
+value component of every pixel in the image is set to the red component.
+
+- “blue-component [image-name]  [destination-name]” -> allows a user to visualize an image where each
+value component of every pixel in the image is set to the blue component.
+
+- “green-component [image-name]  [destination-name]” -> allows a user to visualize an image where each
+value component of every pixel in the image is set to the green component.
+
+- “value-component [image-name] [destination-name]” -> allows a user to visualize an image where each
+value component of every pixel in the image is set to the maximum of the rgb values.
+
+- “intensity-component [image-name]  [destination-name]” -> allows a user to visualize an image where each
+value component of every pixel in the image is set to he average of the rgb values.
+
+- “luma-component  [image-name]  [destination-name]” -> allows a user to visualize an image where each
+value component of every pixel in the image is reset using the luma calculation (.02126r + .7152g + .0722b)
+
+-“blur  [image-name] [destination-name] -> allows a user to blur an image
+
+-“sharpen  [image-name] [destination-name] -> allows a user to sharpen an image
+
+-“luma  [image-name] [destination-name] -> allows a user to execute a luma color transformation
+on an image.
+
+-“sepia  [image-name] [destination-name] -> allows a user to execute a sepia color transformation
+on an image.
+
+-“q”/“Q”/“quit” -> allows the user to quit the program.

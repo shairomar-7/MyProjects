@@ -1,0 +1,373 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math, random, hashlib, zlib, base64
+
+DATA_SIZE = 1375
+
+class Sender:
+    """
+    This sender follows the semantics of TCP Reno.
+    It accepts data from STDIN, sending data until EOF is reached. 
+    The sender first reads all of the data from STDIN using compression and stores it in send_buff,
+    a Map<int, Dict> where the key it the sequence_number, and the value is the packet.
+    The sender has a dynamic congestion window, that increases and decreases based on the
+    acknowledgements received, and any timeouts that occur (slow start, and congestion avoidance).
+    The sender has two crucial functionalities that enhance performance: fast recovery, and fast retransmit.
+    Fast recovery -> if a packet times out, we retransmit that packet, set ssthresh to cwnd / 2, and cwnd back to 2.
+    Fast retransmit -> if 3 duplicate ACKs are received, retransmit the packet that was not received, 
+    and decrease cwnd by half. 
+    When packets are sent out, they are stored in the Map<int, Dict> (seq_num, packet) unacked_packets until they are acked. 
+    When a duplicate ACK is received, it is stored in the Map<int, int> dup_ack_count, where the key is the seq_num and,
+    the value is the count. 
+    """
+    def __init__(self, host, port):
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.RTO = 2
+        self.cwnd = 8
+        self.ssthresh = 128
+        self.unacked_packets = {}
+        self.send_buff = {}
+        self.dup_ack_count = {}
+        self.last_sent_seq_num = 1
+        self.last_ack_seq_num = 1
+        self.packet_retransmitted = None
+        self.isSlowStart = True
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def terminate(self):
+        self.log("All done!")
+        sys.exit(0)
+        
+    def send(self, message):
+        """
+        Sends the given message to this class's host, and remote port, through self's socket.
+
+        Args:
+            message(Dict) -> the dictionary to be JSONiefied and encoded in binary before sending it to the host
+        """
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+    
+    def update_cwnd(self):
+        """
+        Updates the sender's congestion window through one of 2 methods: slow start and congestion avoidance.
+        If the congestion window is less than or equal to ssthresh -> slow start, increment the cwnd by 1
+        If the congestion window is greater than ssthresh -> congestion avoidance, increment the cwnd by 1 / int(self.cwnd)
+        The reason we go into slow start is to quickly discover the network's capacity and probe for congestion, and
+        congestion avoidance in order to avoid overwhelming the network, but maximize it's bandwidth at the same time.
+        """
+        if self.cwnd <= self.ssthresh:
+            self.cwnd = self.cwnd + 1
+        else:
+            self.cwnd = self.cwnd + 1 / int(self.cwnd)
+
+    def update_rto(self, packet):
+        """
+        Updates the retransmission timeout upon receiving an ACK.
+        If we received an ACK for the first packet, we give a 0.2 weight to the inital rtt of 1,
+        and an 0.8 weight packet 1's rtt.
+        If we receive an ACK for any other packet, we give a 0.9 weight to the old rtt, and a
+        0.1 weight to the new rtt of the packet that was acked.
+
+        Args:
+            packet(Dict) -> the packet that was ACK-ed.
+        """
+        time_diff = time.time() - packet["TimeStamp"]
+        if packet["SN"] == 1:
+            self.RTO = (0.2 + (0.8) * time_diff) * 2
+        else:
+            old_rtt = self.RTO / 2
+            new_rtt = old_rtt * 0.9  + (1 - 0.9) * time_diff
+            self.RTO = 2 * new_rtt
+
+    def send_packets(self, eff_wind):
+        """
+        Sends n number of packets out, where n is equal to the effective window computed.
+        The next message to be sent is self.last_sent_seq_num, so we get the packet from
+        the send buffer, add a timestamp, add the message to the Map of unacked packets,
+        send the packet, and increment the last_sent_seq_num.
+        In case the last packet was sent out, a KeyError exception is thrown by Dict.get(Key) and caught.
+
+        Args:
+            eff_wind(int) -> integer representing how many packets can be sent out to the receiver,
+            without overwhelming the network with packets.
+        
+        Returns:
+            int -> returns the number of packets sent out!
+        """
+        for i in range(eff_wind):
+            try:
+                msg = self.send_buff.get(self.last_sent_seq_num)
+                msg["TimeStamp"] = time.time()
+            except:
+                return i
+            self.log("Sending message '%s'" % msg)
+            self.unacked_packets[msg["SN"]] = msg
+            self.send(msg)
+            self.last_sent_seq_num += 1
+        return eff_wind
+
+    def confirm_ack(self):
+        """
+        Confirms the ACK received for first sent unacked packet, which is basically,
+        self.last_ack_seq_num. We pop the packet from the buffer of unacked_packets, 
+        and update the RTO. If the packet is not in the buffer of unacked_packets (exception), it 
+        must be that the packet's sequence number is greater than the last_sent_seq_num.
+        This is expected in cases where we have a timeout, and then receive ACKs of packets
+        that were sent out before the timeout. We then update the congestion window,
+        and increment the last_ack_seq_num. If we receive an ACK for the retransmitted packet,
+        set self.packet_retransmitted to None.
+        """
+        try:
+            packet = self.unacked_packets.pop(self.last_ack_seq_num)
+            self.update_rto(packet)
+        except:
+            packet = self.send_buff.get(self.last_ack_seq_num)
+        self.update_cwnd()
+        self.last_ack_seq_num += 1
+        if self.packet_retransmitted and self.packet_retransmitted["SN"] == self.last_ack_seq_num:
+            self.packet_retransmitted = None
+
+    def update_dup_acks(self, msg):
+        """
+        Updates the Map of duplicate acks: self.dup_ack_count. 
+        If the seq_num of the packet is in dup_ack_count, increment the count,
+        if not, add a new entry in the Map, and set the count to 1. 
+        
+        Args:
+            msg(Dict) -> duplicate ACK packet that was received
+        """
+        if msg["SN"] in self.dup_ack_count:
+            self.dup_ack_count[msg["SN"]] += 1
+        else:
+            self.dup_ack_count[msg["SN"]] = 1
+
+    def process_ack(self, msg):
+        """
+        Processes the given ACK based on the sequence number in the dictionary.
+        If a packet was retransmitted, and we received a previously sent duplicate ack for it,
+        then we just ignore that ACK. 
+        If the packet's seq num is equal to the one we expect, then just confirm the ack.
+        If the packet's seq num is greater than the one we expect, then we must confirm 
+        all of the unacked packets, starting from the one we expect, all the way up till the one we
+        just received. Not, if the packet's seq num is also greater or equal to the last_sent_seq_num,
+        then we fast forward by setting the last_sent_seq_num to the packet's seq num plus 1.
+        If the packet's seq num is 1 less than the one we expect, then it is considered a duplicate
+        ACK, and so we update the dup_ack_count Map.
+
+        Args:
+            msg(Dict) -> dictionary representing the ACK we received from the receiver.
+
+        Returns:
+            bool -> indicating whether we were able to confirm the ACK or not. 
+        """
+        if self.packet_retransmitted and msg["SN"] == self.packet_retransmitted["SN"] - 1:
+            return False
+        elif msg["SN"] == self.last_ack_seq_num:
+            self.log("Received message '%s'" % msg)
+            self.confirm_ack()
+            return True
+        elif msg["SN"] > self.last_ack_seq_num:
+            num_packets = msg["SN"] - self.last_ack_seq_num
+            self.log("Received message '%s'" % msg)
+            if msg["SN"] >= self.last_sent_seq_num:
+                self.last_sent_seq_num = msg["SN"] + 1
+            for i in range(num_packets + 1):
+                self.confirm_ack()
+            return True
+        elif msg["SN"] == self.last_ack_seq_num - 1: # 
+            self.log("Received message '%s'" % msg)
+            self.update_dup_acks(msg)
+        return False
+  
+    def get_dups_acks(self):
+        """
+        Returns the sequence number of 3 duplicate ACKs received.
+        Iterate over the keys (seq nums) of the dup_ack_count Map,
+        and if the count is greater or equal to 3, return the sequence number.
+
+        Returns:
+            int -> sequence number of the 3 duplicate ACKs received.
+        """
+        for i in self.dup_ack_count.keys():
+            dup = self.dup_ack_count[i]
+            if dup >= 3:
+                return i
+        return None
+
+    def fast_recovery(self):
+        """
+        TCP Reno's fast recovery. It gets the packet from the unacked packets Map
+        that we expect an ACK for next. If an exception is raised, clear the Map because
+        it contains outdated unacked packets, and exit the function.
+        If not, compute the time difference between NOW and the time the packet was sent,
+        and if the time difference is greater than the retransmission timeout, go back into
+        slow start, set ssthresh to half the cwnd, set cwnd back to intial value of 2, 
+        set the last_sent_seq_num to 1 plus the sequence number we expect next as an ACK.
+        Update the timestamp, clear the dup_ack_count Map because we are starting over,
+        update the packet int the unacked_packets Map to reflect the new time stamp, 
+        and finally, send the packet to the receiver.
+
+        Returns:
+            bool -> returns whether or not a packet was indeed retransmitted.
+        """
+        if len(self.unacked_packets) > 0:
+            try:
+                packet = self.unacked_packets[self.last_ack_seq_num]
+            except:
+                self.unacked_packets.clear()
+                return False
+            timeDiff = time.time() - packet["TimeStamp"]
+            if timeDiff > self.RTO:
+                self.isSlowStart = True
+                self.ssthresh = max(int(self.cwnd / 2), 2)
+                self.cwnd = 2
+                self.last_sent_seq_num = self.last_ack_seq_num + 1
+                packet["TimeStamp"] = time.time()
+                self.dup_ack_count.clear()
+                self.unacked_packets[packet["SN"]] = packet
+                self.send(packet)
+                self.log("Sending message '%s'" % packet)
+                return True
+        return False
+
+    def fast_retransmit(self):
+        """
+        TCP Reno's fast retransmit. If we received 3 duplicate acks,
+        ie, dup is not none, then we try to get the corresponding packet
+        from the Map of unacked_packets. If unsuccessful due to exception, we return False.
+        If successful, we update RTO, update the timestamp for the packet before retransmitting,
+        we add the updated packet back to the Map of unacked_packets. Upon receiving 3 dup acks,
+        we go into congestion avoidance, halve the cwnd, clear the dup_ack_count Map, 
+        and finally we retransmit the updated packet to the receiver. 
+
+        Returns:
+            bool -> indicating whether a packet was retransmitted or not.
+        """
+        dup = self.get_dups_acks()
+        if dup != None:
+            try:
+                packet = self.unacked_packets[dup + 1]
+            except:
+                return False
+            self.update_rto(packet)
+            packet["TimeStamp"] = time.time()
+            self.unacked_packets[packet["SN"]] = packet
+            self.isSlowStart = False
+            if self.cwnd > 2:
+                self.cwnd /= 2
+            self.dup_ack_count.clear()
+            self.packet_retransmitted = packet
+            self.send(packet)
+            self.log("Sending message '%s'" % packet)
+            return True
+        return False
+
+    def receive_acks(self):
+        """
+        Receives the ACK packets from the receiver.
+        Keep looping as long as the sock is ready for an IO operation, 
+        receive data from the socket, and try deserialising it. If an
+        exception occurs, the packet is corrupt and we just ignore it.
+        If no exception occurs, we process the ack received. If we were able
+        to confirm the ack, then the next iteration takes place. If not,
+        we check to see if we received 3 duplicate acks and do a fast retransmit.
+        If a packet was not retransmitted upon 3 duplicate acks, we check if the first
+        sent packet has timed out yet, if it did we do a fast recovery.
+        """
+        rv = False
+        while True:
+            sock = select.select([self.socket], [], [], 0)[0]
+            if sock:
+                k, addr = self.socket.recvfrom(65535)
+                try:
+                    msg = json.loads(k.decode('utf-8'))
+                    rv = self.process_ack(msg) 
+                except:
+                    self.log("Corrupt ACK-packet!")
+                if not (rv or self.fast_retransmit()):
+                    self.fast_recovery()
+            else:
+                break
+        return
+
+    def get_eff_wnd(self):
+        """
+        Returns the effective window, which is essentially the number of packets that the sliding window 
+        allows us to send to the receiver without creating congestion, and overflowing the receiver's buffer.
+        The eff_wnd is computed by the following formula:
+        eff_wnd = min(cwnd, adv_wnd) - (last_sent_seq_num - last_ack_seq_num)
+        If the eff_wnd is negative we return 0, if not, we return the computed value.
+        Assumption: the adv_wnd is 128.
+
+        Returns:
+            int -> the computed value for the effective window.
+        """
+        eff_wnd = min(self.cwnd, 128) - (self.last_sent_seq_num - self.last_ack_seq_num)
+        return max(eff_wnd, 0)
+
+    def read_data(self):
+        """
+        Reads all the data from STDIN and stores it in a Map<int, Dict> send_buff.
+        The compression ratio is 1.3, and so, we could read in 1.3 * DATA_SIZE bytes 
+        at a time, and store the compressed data in the msg. This is done to minimize
+        the total number of packets to be sent, thus decreasing congestion and increasing
+        performance. We compute the hash value for the data, and construct the packet containing
+        the "type" (msg), the "data" (compressed data), the "SN" (sequence number), and the "hash".
+        If the length of data read in is less than the max, than we know this is the last packet,
+        and so we break from the loop.
+        """
+        index = 0
+        while True:
+            max = round(DATA_SIZE * 1.3)
+            data = sys.stdin.read(max)
+            dataCompressed = zlib.compress(data.encode('utf-8'))
+            data_encoded = base64.b64encode(dataCompressed).decode('ascii')
+            hash = hashlib.sha1(str.encode(data)).hexdigest()
+            msg = {"type": "msg", "data": data_encoded, "SN": self.last_ack_seq_num + index, "hash": hash}
+            self.send_buff[msg["SN"]] = msg
+            index += 1
+            if len(data) < max:
+                break
+
+    def run(self):
+        """
+        Runs the sender program, by initially reading all the data into the send_buff Map,
+        and then we keep looping until the last packet's acknowledgement was received.
+        First, we wait for 0.05 seconds for the socket to be ready, and compute the eff_wnd.
+        If the socket is ready for reading, then we receive the acks and process them. Else if,
+        the effective window is 0, then check if the first sent packet in the unacked_packets has
+        timed out. Else, send out eff_wnd number of packets, and if the last_sent_seq_num is the 
+        last packet to be sent, and that packet was acked, exit gracefully. If the num of packets 
+        sent is 0, then check if the first sent packet has timed out. 
+        """
+        self.read_data()
+        while True:
+            sock = select.select([self.socket], [], [], 0.05)[0]
+            eff_wnd = self.get_eff_wnd()
+            if sock:
+                self.receive_acks()
+            elif eff_wnd == 0:
+                self.fast_recovery()
+            else:
+                num_packets_sent = self.send_packets(round(eff_wnd))
+                if self.last_sent_seq_num == self.last_ack_seq_num and self.last_sent_seq_num == len(self.send_buff) + 1:
+                    sys.exit(0)
+                if (num_packets_sent == 0):
+                    self.fast_recovery()
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
+

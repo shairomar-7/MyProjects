@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os, random
+
+BROADCAST = "FFFF"
+BUFFER = 65535
+
+FOLLOWER = 'follower'
+CANDIDATE = 'candidate'
+LEADER = 'leader'
+
+class Replica:
+    def __init__(self, port, id, replicas):
+        """
+        Initializes a Replica object.
+
+        Args:
+            port(int): represents the port number.
+            id(string): represents the id of the replica.
+            others(List<string>): represents the ids of the other replicas in the DS.
+        """
+
+        self.port = port
+        self.id = id
+        self.others = replicas
+
+        self.voteCount = 0
+        self.candidateVote = 'FFFF'
+        self.currentTerm = 0
+        self.leader = BROADCAST
+        self.state = FOLLOWER
+        self.frontier = []
+        self.dataStore = {}
+        self.log = []
+        
+        self.lastLeaderContact = None
+        self.timeOfElection = None
+        self.maxLeaderTimeoutDuration = 0.5
+        self.electionWaitTime = random.uniform(0.1, 0.3)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('localhost', 0))
+
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+
+    def send(self, message):
+        """
+        Sends the message from this replica to some other replica in the distributed system.
+
+        Args:
+            message(Dict) -> represents the message to be sent to some other replica (specified in 'dst')
+        """
+        self.sock.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        print("Sent message: %s" % message, flush=True)
+
+    def run(self):
+
+        """
+        Runs the Raft consensus. We keep looping (until the simulator)
+        ends the program, and we delegate to the different state handler functions,
+        based on this replica's state. We receive a message, and handle that message.
+        Handles the different types of messages received by another replica in the Distributed Sytem.
+        This function delegates to specific type handlers of this Replica class. If the message's source
+        is a leader, then we update the lastLeaderContact to reflect the timestamp of the last received heartbeat.
+        """
+
+        if self.timeOfElection is None:
+            self.timeOfElection = time.time()
+
+        if self.lastLeaderContact is None:
+            self.lastLeaderContact = time.time()
+        
+        while True:
+
+            if self.state == LEADER:
+                self.runLeader()
+            elif self.state == CANDIDATE:
+                self.runCandidate()
+            elif self.state == FOLLOWER:
+                self.runFollower()
+
+            sockets = select.select([self.sock], [], [], 0.1)[0]
+
+            if self.sock in sockets:
+                response = self.sock.recv(BUFFER)
+
+                if not response:
+                    continue
+
+                dictInfo = json.loads(response)
+
+                if dictInfo['src'] == self.leader:
+                    self.lastLeaderContact = time.time()
+                if dictInfo['type'] == 'heartbeat':
+                    self.handleHeartbeat(dictInfo)
+                elif dictInfo['type'] in ['get', 'put']:
+                    self.handleClientRequest(dictInfo)
+                elif dictInfo['type'] == 'requestVote':
+                    self.handleVoteRequest(dictInfo)
+                elif dictInfo['type'] == 'approveVote' and self.state == CANDIDATE:
+                    self.handleElection(dictInfo)
+                elif dictInfo['type'] == 'requestAppend':
+                    self.updateEntries(dictInfo)
+
+    def runLeader(self):
+        """
+        Handles the functionality of a leader.
+        If 0.25 seconds went by without leader contact,
+        then for each replica in the DS, we send a heartbeat, indicating
+        that the leader's ID is this replica's ID. We then update the last leader contact.
+        """
+        currentTime = time.time()
+        if .25 < currentTime - self.lastLeaderContact:
+            for replica in self.others:
+                msg = {'src': self.id, 'dst': replica, 'leader': self.leader, 'term': self.currentTerm, 'type': 'heartbeat'}
+                self.send(msg)
+            self.lastLeaderContact = currentTime
+
+    def runCandidate(self):
+        """
+        Handles the functionality of a candidate.
+        If the election wait time is exceeded, then we begin
+        a new election.
+        """
+        currentTime = time.time()
+        if self.electionWaitTime < currentTime - self.timeOfElection:
+            self.beginElection()
+
+    def runFollower(self):
+        """
+        Handles the functionality of a follower.
+        If the leader is unknown or timed out, we switch to
+        candidate state, and begin a new election.
+        """
+        currentTime = time.time()
+        if self.leader == 'FFFF' or self.maxLeaderTimeoutDuration < currentTime - self.lastLeaderContact:
+            if currentTime - self.timeOfElection > self.electionWaitTime:
+                self.state = CANDIDATE
+                self.beginElection()
+
+    def handleHeartbeat(self, dictInfo):
+        """
+        Handles the received heartbeat from some other replica in this DS.
+
+        Args:
+            dictInfo(Dict) -> message received by some other replica in this DS.
+        """
+        if self.state == LEADER:
+            self.beginElection()
+            return
+        if self.currentTerm <= dictInfo['term']:
+            self.leader = dictInfo['src']
+            self.candidateVote = 'FFFF'
+            self.state = FOLLOWER
+        
+            self.lastLeaderContact = time.time()
+        for dictInfo in self.frontier:
+            redir = {"src": dictInfo['dst'], "dst": dictInfo['src'], "leader": self.leader, "type": "redirect",
+                        "MID": dictInfo['MID']}
+            self.send(redir)
+
+        self.frontier = []
+
+    def handleClientRequest(self, req):
+        """
+        Handles the client request. If this replica is a leader,
+        then we delegate to the leaderHandleClientRequest, and we send
+        AppendEntry RPCs to other replicas in this DS for log replication.
+        If this replica is not a leader, and the leader is known, then we 
+        redirect the client request to the leader. If the leader is not known,
+        we add the request to the frontier to be processed once a leader is known.
+
+        Args:
+            req(Dict) -> represents the client's request.
+        """
+        if self.state == LEADER:
+            self.leaderHandleClientRequest(req)
+            for replica in self.others:
+                entry = {"src": self.id, "dst": replica, "leader": self.leader, "type": 'requestAppend',
+                           'content': self.getEntries()}
+                self.send(entry)
+        elif self.leader != 'FFFF':
+            redirect = {"src": req['dst'], "dst": req['src'], "leader": self.leader, "type": "redirect",
+                        "MID": req['MID']}
+            self.send(redirect)
+        else:
+            self.frontier.append(req)
+
+    def leaderHandleClientRequest(self, req):
+        """
+        Handles client GET and PUT requests, by either replying with "ok",
+        or "fail". If the client request is a GET, then if the key is in the 
+        datastore, we return it to the client, and if not, we return a 'fail'.
+        If the client request is a PUT, we add the new entry to the log and datastore.
+
+        Args:
+            req(Dict) -> represents the client's request.
+        """
+        if req['type'] == 'get':
+            if req['key'] in self.dataStore:
+                val = self.dataStore[req['key']]
+
+                response = {'src': self.id, 'dst': req['src'],
+                        'leader': self.id, 'MID': req['MID'], 'type': 'ok', 'value': val}
+            else:
+                response = {'src': self.id, 'dst': req['src'],
+                        'leader': self.id, 'MID': req['MID'], 'type': 'fail'}
+            self.send(response)
+    
+        elif req['type'] == 'put':
+            self.dataStore[req['key']] = req['value']
+
+            response = {'src': self.id, 'dst': req['src'],
+                    'leader': self.id, 'MID': req['MID'], 'type': 'ok'}
+            
+            self.addEntryToLog(req)
+            self.send(response)
+
+    def handleVoteRequest(self, dictInfo):
+        """
+        Handles the received RequestVote RPC from some other replica in the DS.
+        If the replica who requested a vote has a term less than this replica's, then
+        we reject the vote. If not, we accept the vote, revert to follower state,
+        and update the stored leader's ID.
+
+        Args:
+            dictInfo(Dict) -> the message received from some other replica in the DS.
+        """
+        self.leader = 'FFFF'
+
+        if self.currentTerm >= dictInfo['term']:
+            response = {'src': self.id, 'dst': dictInfo['src'], 'leader': self.leader,
+                        'type': 'rejectVote'}
+        else:
+            self.currentTerm = dictInfo['term']
+            self.candidateVote = dictInfo['src']
+            self.state = FOLLOWER
+            self.leader = dictInfo['src']
+            
+            response = {'src': self.id, 'dst': self.candidateVote, 'leader': self.leader,
+                        'type': 'approveVote', 'term': self.currentTerm, 'content': self.getEntries()}
+            
+        self.timeOfElection = time.time()
+
+        self.send(response)
+
+    def beginElection(self):
+        """
+        Upon initialization of the DS, we begin the Raft election process.
+        Increment the currentTerm, vote for yourself, set the voteCount to 1,
+        reset the timeOfElection to NOW, and ask for votes from other replicas of this DS.
+        """
+        self.currentTerm += 1
+        self.candidateVote = self.id
+        self.voteCount = 1
+        self.leader = 'FFFF'
+        
+        self.timeOfElection = time.time()
+        
+        self.askForVotes()
+        
+    def askForVotes(self):
+        """
+        Sends RequestVote RPCs to all other replicas in this Distributed System.
+        """
+        for replica in self.others:
+            voteRequest = {'src': self.id, 'dst': replica, 'leader': self.leader,
+                    'type': 'requestVote', 'term': self.currentTerm}
+            self.send(voteRequest)
+
+    def handleElection(self, dictInfo):
+        """
+        Handles the Raft election process, by incrementing the voteCount,
+        updating this replica's log entries. If the voteCount is greater than or
+        equal to 3, then this replica becomes a leader.
+        """
+        self.voteCount += 1
+        self.updateEntries(dictInfo)
+        if self.voteCount >= 3:
+            self.voteCount = 0
+            self.leader = self.id
+            self.state = LEADER
+
+            self.dataStore = {}
+
+            self.rebuildDataStoreFromLog()
+
+    def rebuildDataStoreFromLog(self):
+        """
+        Rebuilds the data store from this replica's log history.
+        """
+        for entry in self.log:
+            self.dataStore[entry['key']] = entry['value']
+
+    def getEntries(self):
+        """
+        Gets the last 100 entries of this replica's log.
+
+        Returns:
+            List<Dict> -> returns the last 100 logs from this replica's log.
+        """
+        entries = []
+        for i in range(100,0,-1):
+            if (len(self.log)<i):
+                continue
+            entries.append(self.log[len(self.log)-i])
+        return entries
+    
+    def addEntryToLog(self, entry):
+        """
+        Adds the given entry to this replica's log history.
+
+        Args:
+            entry(Dict) -> represents a log entry that must be added to the log.
+        """
+        logEntry = {'key': entry['key'], 'value': entry['value']}
+        self.log.append(logEntry)
+
+
+    def updateEntries(self, dictInfo):
+        """
+        Upon receiving AppendEntry RPCs from the leader,
+        we must update this replica's log history as well as its datastore
+        to include the missing entries, if at all missing.
+
+        Args:
+            dictInfo(Dict) -> message received by some other replica (leader in this case) in the DS.
+        """
+        for entry in dictInfo['content']:
+            if entry not in self.log:
+                self.addEntryToLog(entry)
+                self.dataStore[entry['key']] = entry['value']
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    server = Replica(args.port, args.id, args.others)
+    server.run()

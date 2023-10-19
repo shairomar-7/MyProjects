@@ -1,0 +1,641 @@
+#!/usr/bin/env -S python3 -u
+import argparse, socket, json, select, struct, select, copy
+
+class Router:
+    """
+    Router class represents a BGP router's functionality.
+    It maintains a table of routing information, the forwarding table, 
+    which includes information about the best paths to reach destination networks. There will be 2 tables,
+    the unaggregated_table which gets updated upon receive a route update/revocation announcement, and the aggregated_table,
+    which is rebuilt upon receiving a route revocation announcement from the unaggregated_table. 
+    The router also accepts and forwards update/revocation announcements to the neighbors, depending on the relationship.
+    It forwards data packets towards their correct destination upon a request, if it has a path to the destination.
+    It also supports the aggregation of forwarding table entries for networks that are adjacent and on the same port. 
+    """
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        self.relations = {}
+        self.sockets = {}
+        self.ports = {}
+        self.unaggregated_table = []
+        self.aggregated_table = []
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.ip_mod(neighbor), "dst": neighbor, "msg": {}}))
+
+    def getMaskCount(self, netmask):
+        """
+        Computes the cidr netmask count and returns the count
+
+        Args:
+            netmask(string) -> network netmask in string decimal dotted notation (for ex: "255.255.0.0")
+        
+        Returns:
+            int -> netmask count in cidr
+        """
+        return sum([bin(int(x)).count('1') for x in netmask.split('.')])
+
+    def netMaskCount_to_dotted(self, netMaskCount):
+        """
+        Gets the string decimal dotted netmask from the cidr netmask count
+
+        Args:
+           netMaskCount(int) -> network netmask in cidr notation (for ex: 8) 
+
+        Returns:
+            string -> network netmask in decimal dotted notation
+        """
+        netmask = (0xffffffff << (32 - netMaskCount)) & 0xffffffff
+        return socket.inet_ntoa(struct.pack('>I', netmask))
+
+    def getIpBin(self, ipAddress):
+        """
+        Converts the given IP address in decimal string notation, to a binary integer.
+
+        Args:
+            ipAddress(string) -> some IP address in decimal string notation (for ex: "192.168.10.0")
+
+        Returns:
+            int -> binary integer representing the given ip address
+        """ 
+        return int(''.join(bin(int(part))[2:].zfill(8) for part in ipAddress.split('.')), 2)
+
+    def isAdjacent(self, network1, netmask1, network2, netmask2):
+        """
+        Returns a pair where the first indicates whether network1 and network2 are adjacent,
+        and the second indicates the netmask count in cidr. 
+        Note: 2 networks are adjacent if all bits (up till count of cidr netmask -1) match except for the last one.
+
+        Args:
+            network1(string) -> IP address of the first network
+            netmask1(string) -> decimal dotted netmask of the first network
+            network2(string) -> IP address of the second network
+            netmask2(string) -> decimal dotted netmask of the second network
+        
+        Returns:
+            pair(b: bool, i: int) -> where b indicates whether the 2 networks are adjacent, and i is
+            the cidr netmask of the 2 networks.
+        """
+        if netmask1 == netmask2:
+            countMask = self.getMaskCount(netmask1)
+            network1_prefix = [int(i) & int(j) for i, j in zip(network1.split('.'), netmask1.split('.'))]
+            network2_prefix = [int(i) & int(j) for i, j in zip(network2.split('.'), netmask2.split('.'))]
+            network1_bin = [bin(x).replace('0b', "").zfill(8) for x in network1_prefix]
+            network2_bin = [bin(x).replace('0b', "").zfill(8) for x in network2_prefix]
+            network1_bin_list = list(''.join(network1_bin))
+            network2_bin_list = list(''.join(network2_bin))
+            return (network1_bin_list[:countMask - 1] == network2_bin_list[:countMask - 1], countMask)
+        return (False, 0)
+
+    def isSameAtts(self, packet, route):
+        """
+        Indicates whether the attributes in the route announcement "packet", are the same as in "route".
+        This is done to check if the two routes can be aggregated!
+        Attributes checked: src (same next hop router), localpref, selfOrigin, ASPath, and origin 
+
+        Args:
+            packet(dictionary) -> represents the newly received route announcement
+            route(dictionary) -> represents some previous route announcement 
+            Note: they both have the same exact format
+        
+        Returns:
+            bool -> indicates whether the 2 routes have the same attributes
+        """
+        packetMsg = packet["msg"]
+        routeMsg = route["msg"]
+        return packet["src"] == route["src"] and \
+            packetMsg["localpref"] == routeMsg["localpref"] and \
+                packetMsg["selfOrigin"] == routeMsg["selfOrigin"] and \
+                    packetMsg["ASPath"] == routeMsg["ASPath"] and \
+                        packetMsg["origin"] == routeMsg["origin"]
+
+    def aggregateHelper(self, packet, route):
+        """
+        Determines if the 2 routes, "packet" and "route", can be aggregated to one route, and returns a pair,
+        where the first is the network prefix, and the second is the new network mask in cidr. 
+        If the 2 routes can't be aggrregated, null/none is returned.
+        Note: If the 2 routes are aggregated, we choose the smaller IP of the 2 networks, and the netmask, in cidr,
+        is decremented by one. 
+
+        Args:
+            packet(dictionary) -> represents the newly received route announcement
+            route(dictionary) -> represents some previous route announcement 
+            Note: they both have the same exact format
+        
+        Returns:
+            pair(n: string, m: int) or None -> where n is the IP of the aggregated network,
+            in decimal string dotted notation, and m is the netmask in cidr.
+        """
+        network1 = packet["msg"]["network"]
+        network2 = route["msg"]["network"]
+        isAdjPair = self.isAdjacent(network1, packet["msg"]["netmask"],network2, route["msg"]["netmask"])
+        if isAdjPair[0] and self.isSameAtts(packet, route):
+            newMask = self.netMaskCount_to_dotted(isAdjPair[1] - 1)
+            if network1 > network2: 
+                return (network2, newMask)
+            else: 
+                return (network1, newMask)
+        return None
+
+    def aggregate(self, packet, removeHuh = False):
+        """
+        Attempts to aggregate the given packet with either one of the entries in the aggregated forwarding table.
+        If we were able to aggregate the given packet, then we recursively try to aggregate the aggregated route,
+        with any other entry in the forwarding table. Once no aggregation takes place, this function terminates.
+
+        Args:
+            packet(dictionary) -> represents the newly received route announcement
+            removeHuh(bool): optional -> indicates whether we should remove the given packet after aggregating; 
+            this is set to true when we recursively try to aggregate a new aggregated route, because that route
+            is already in the forwarding table, and should be removed if aggregated once again.
+        
+        Returns:
+            boolean-> indicates whether the given packet was aggregated with any other route in the forwarding table
+        """
+        if len(self.aggregated_table) != 0:
+            for route in self.aggregated_table:
+                if route != packet:
+                    aggregatedNet = self.aggregateHelper(packet, route)
+                    if aggregatedNet:
+                        route["msg"]["network"] = aggregatedNet[0]
+                        route["msg"]["netmask"] = aggregatedNet[1]
+                        if removeHuh:
+                            self.aggregated_table.remove(packet)
+                        return self.aggregate(route, True) or True
+        return False
+
+    def reaggregate(self):
+        """
+        Rebuilds the aggregated forwarding table by iterating over the unaggregated and updated forwarding table,
+        and attempts to aggregate every route. If it couldn't aggregate the route, it will just append the route to
+        the table.
+        """
+        self.aggregated_table = []
+        for update in self.unaggregated_table:
+            deepCopy = copy.deepcopy(update)
+            if not self.aggregate(deepCopy):
+                self.aggregated_table.append(deepCopy)
+
+    def getLongestPrefix(self, ip):
+        """
+        Returns the routes that have a longest prefix match. To do this, simply sort the aggregated forwarding table
+        by ascending cidr netmask (count of consecutive 1s), and find the longest prefix match. Once we have found 
+        a match, if the next entry has a netmask smaller than the longest prefix match's netmask, return the routes.
+        Else, check if the given ip belongs to that network, and if it does, add it to the list of routes.
+
+        Args:
+            ip(string) -> IP address of some destination in decimal dotted notation
+        
+        Returns:
+            list<dictionary> -> the list of routes (basically aggregated or unaggregated route announcements) with a 
+            longest prefix match for the given destination IP address.
+        """
+        routes = []
+        ip_bin = self.getIpBin(ip)
+        self.aggregated_table = sorted(self.aggregated_table, key=lambda x: self.getMaskCount(x["msg"]["netmask"]), reverse=True)
+        longestPrefixMask_bin = None
+        for route in self.aggregated_table:
+            net_bin = self.getIpBin(route["msg"]["network"])
+            netmask_bin = self.getIpBin(route["msg"]["netmask"])
+            if longestPrefixMask_bin and netmask_bin < longestPrefixMask_bin:
+                break
+            if (netmask_bin & ip_bin) == net_bin:
+                if not longestPrefixMask_bin:
+                    longestPrefixMask_bin = netmask_bin
+                routes.append(route)
+        return routes
+
+
+    def get_highest_localPref(self, routes):
+        """
+        Gets the list of routes with a highest localPref. This function basically finds the route with a maximum
+        localPref, and then apppends to the list of routes any other route with an equal localPref to the maximum.
+
+        Args:
+            routes(list<dictionary>) -> a list of aggregated/unaggregated route announcements that are being compared,
+            to find the best possible route to a particular destination. 
+
+        Returns:
+            list<dictionary> -> a list of routes with the maximum localPref from the given "routes"
+        """
+        maxLocalPref = float('-inf')
+        highestLocalPrefRoutes = []
+        for route in routes:
+            msg = route["msg"]
+            if msg["localpref"] > maxLocalPref:
+                maxLocalPref = msg["localpref"]
+                highestLocalPrefRoutes = [route]
+            elif msg["localpref"] == maxLocalPref:
+                highestLocalPrefRoutes.append(route)
+        return highestLocalPrefRoutes
+
+    def get_true_selfOrigin(self, routes):
+        """
+        Gets the list of routes with self origin true. If none of the routes have self origin true, 
+        then an empty list is returned.
+
+        Args:
+            routes(list<dictionary>) -> a list of aggregated/unaggregated route announcements that are being compared,
+            to find the best possible route to a particular destination. 
+
+        Returns:
+            list<dictionary> -> a list of routes with the attribute, self origin, being true
+        """
+        trueSelfOriginRoutes = []
+        for route in routes:
+            if route["msg"]["selfOrigin"] == True:
+                trueSelfOriginRoutes.append(route)
+        return trueSelfOriginRoutes
+
+    def get_shortest_ASPath(self, routes):
+        """
+        Gets the list of routes with the shortest ASPath length. This function basically finds the route with a minimum
+        ASPath length, and then apppends to the list of routes any other route with an equal path length to the minimum.
+
+        Args:
+            routes(list<dictionary>) -> a list of aggregated/unaggregated route announcements that are being compared,
+            to find the best possible route to a particular destination. 
+
+        Returns:
+            list<dictionary> -> a list of routes with the minimum ASPath length from the given "routes"
+        """
+        shortestASPathRoutes = []
+        minASPath = float('inf')
+        for route in routes:
+            msg = route["msg"]
+            if len(msg["ASPath"]) < minASPath:
+                shortestASPathRoutes = [route]
+            elif len(msg["ASPath"]) == minASPath:
+                shortestASPathRoutes.append(route)
+        return shortestASPathRoutes
+
+    def origin_to_int(self, origin):
+        """
+        Assigns values to the origin attribute of a route announcement based on the preference.
+        Preference: IGP > EGP > UNK
+
+        Args:
+            origin(string) -> the origin of a route announcement, and is one of: IGP, EGP, or UNK
+        
+        Returns:
+            int -> representing the preference of an origin, where IGP is 2, EGP is 1, and UNK or anything other is 0.
+        """
+        if origin == "IGP":
+            return 2
+        elif origin == "EGP":
+            return 1
+        return 0
+
+    def get_best_origin(self, routes):
+        """
+        Gets the list of routes with the best origin. This function basically finds the route with the most prefered 
+        origin, and then apppends to the list of routes any other route with an equal origin preference.
+
+        Args:
+            routes(list<dictionary>) -> a list of aggregated/unaggregated route announcements that are being compared,
+            to find the best possible route to a particular destination. 
+
+        Returns:
+            list<dictionary> -> a list of routes with the most preferred origin attribute from the given "routes"
+        """
+        bestOriginRoutes = []
+        bestOrigin = -1
+        for route in routes:
+            originInt = self.origin_to_int(route["msg"]["origin"])
+            if originInt > bestOrigin:
+                bestOrigin = originInt
+                bestOriginRoutes = [route]
+            elif originInt == bestOrigin:
+                bestOriginRoutes.append(route)
+        return bestOriginRoutes
+
+    def get_lowest_ip(self, routes):
+        """
+        Gets the route with the lowest peer's (neighbor, or next-hop router) IP address.
+
+        Args:
+            routes(list<dictionary>) -> a list of aggregated/unaggregated route announcements that are being compared,
+            to find the best possible route to a particular destination. 
+
+        Returns:
+            dictionary -> the route with the lowest peer's IP address      
+        """
+        lowestIPRoute = None
+        lowestIp = "255.255.255.255"
+        for route in routes:
+            if route["src"] < lowestIp:
+                lowestIp = route["src"]
+                lowestIPRoute = route
+        return lowestIPRoute
+            
+    def get_best_route(self, routes):
+        """
+        Gets the best route to a particular destination from the given list of potential routes. The algorithm works
+        in the following manner: get the routes with the highest localpref, if localprefs are equal, then get the routes
+        with a selfOrigin of true, if the selfOrigins are equal, then get the routes with shortest ASPath, and if equal,
+        get the routes with the best origin, and if equal, get the route with the lowest IP address.
+        Note: every step of determining the best routes uses a smaller set of the given "routes" based on the filter.
+
+        Args:
+            routes(list<dictionary>) -> a list of aggregated/unaggregated route announcements that are being compared,
+            to find the best possible route to a particular destination. 
+
+        Returns:
+            dictionary -> the best route to get to the destination from the given "routes"           
+        """
+        highestLocalPrefRoutes = self.get_highest_localPref(routes)
+        if len(highestLocalPrefRoutes) == 1:
+            return highestLocalPrefRoutes[0]
+        trueSelfOriginRoutes = self.get_true_selfOrigin(highestLocalPrefRoutes)
+        if len(trueSelfOriginRoutes) == 1:
+            return trueSelfOriginRoutes[0]
+        elif len(trueSelfOriginRoutes) == 0: 
+            trueSelfOriginRoutes = highestLocalPrefRoutes
+        shortesASPathRoutes = self.get_shortest_ASPath(trueSelfOriginRoutes)
+        if len(shortesASPathRoutes) == 1:
+            return shortesASPathRoutes[0]
+        bestOriginRoutes = self.get_best_origin(shortesASPathRoutes)
+        if len(bestOriginRoutes) == 1:
+            return bestOriginRoutes[0]
+        return self.get_lowest_ip(bestOriginRoutes)
+
+    def forward_data_legally(self, packet, srcif, route):
+        """
+        Forwards the packet to the destination through the given "route" based on the legality. If legal, we forward it,
+        and if illegal, we respond back to the source of the request a "no route".
+        Legal -> if the src or dest is a customer, and Illegal otherwise.
+
+        Args:
+            packet(dictionary) -> the data packet being forwarded through this BGP router
+            srcif(string) -> IP address of the source of the request (one of the neighbors). 
+            route(dictionary) -> the best route found from the aggregated table to get to the desired destination network.
+        
+        Returns:
+            None -> void function that either forwards the packet, or returns a "no route" to the source of the request.
+        """
+        if (self.relations[srcif] == "cust") or (self.relations[route["src"]] == "cust"):
+            self.send(route["src"], json.dumps(packet))
+        else:
+            self.send(srcif, self.construct_no_route(packet, srcif)) 
+   
+    def forward_data(self, packet, srcif):
+        """
+        Forwards the given data packet from "srcif" by finding the best route with the longest prefix match if the
+        data is being forwarded legally. If illegal forwarding, or if there is no route to the destination, then
+        a "no route" message is sent back to the src (neighbor) of the request. 
+
+        Args:
+            packet(dictionary) -> the data packet being forwarded through this BGP router
+            srcif(string) -> IP address of the source of the request (one of the neighbors). 
+        
+        Returns:
+            None -> void function either forwards the request through the best route, or responds back with a "no route".
+        """
+        routes = self.getLongestPrefix(packet["dst"])
+        if len(routes) == 0:
+            self.send(srcif, self.construct_no_route(packet, srcif)) 
+        elif len(routes) == 1: 
+            self.forward_data_legally(packet, srcif, routes[0])  
+        else:
+            route = self.get_best_route(routes)
+            self.forward_data_legally(packet, srcif, route)  
+
+    def ip_mod(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    def construct_update(self, update, network):
+        """
+        Constructs the route announcement to be forwarded to the given network.
+
+        Args:
+            update(dictionary) -> the received route announcement that will be forwarded to neighbors
+            network(string) -> IP address of the destination (neighbor)
+        
+        Returns:
+            JSON -> a JSON string representing the route announcement to be forwarded to the given "network"
+        """
+        path = list(update["msg"]["ASPath"])
+        path.insert(0, self.asn)
+        message = {
+            "src": network.replace(".2", ".1"),
+            "dst": network,
+            "type": "update",
+            "msg": 
+            {
+               "network": update["msg"]["network"],
+               "netmask": update["msg"]["netmask"],
+                "ASPath":  path
+            }
+        }
+        return json.dumps(message)
+
+    def construct_no_route(self, packet, srcif):
+        """
+        Constructs the "no route" response to be sent back to the src of the packet through the neighbor.
+
+        Args:
+            packet(dictionary) -> the received announcement/data forward request.
+            srcif(string) -> IP address of the neighbor who sent the packet (neighbor)
+        
+        Returns:
+            JSON -> a JSON string representing the "no route" response to be sent back to "srcif", destined to the 
+            source of the packet. 
+        """
+        noRoute = {
+            "src":  srcif,
+            "dst":  packet["src"],
+            "type": "no route",
+            "msg": {}
+        }
+        return json.dumps(noRoute)
+
+    def construct_revocation(self, revocation, network):
+        """
+        Mutates the revocation to include the new src and dst, and returns the jsonified string.
+        the new src is just this BGP router, and the dst would be the network IP that we are sending the revocation to.
+
+        Args:
+            revocation(dictionary) -> represents the withdraw announcement received by one of the neighbors.
+            network(string) -> IP address of the destination of this announcement (one of the neigbors)
+        
+        Returns:
+            JSON -> a JSON string representing the updated withdraw announcement to be sent to the given "network"
+        """
+        revocation["src"] = network.replace(".2", ".1")
+        revocation["dst"] = network
+        return json.dumps(revocation)
+
+    def construct(self, announcement, network, type = "update"):
+        """
+        Constructs either an route announcement, a withdraw announcement, or a "no route" announcement.
+
+        Args:
+            announcement(dictionary) -> the route/withdraw announcement to be forwarded to the network
+            network(string) -> the IP address of the destination of the announcement
+            type(string): optional -> the type of message (update, revocation, no route) to be sent to the given "network" 
+
+        Returns:
+            JSON -> a JSON string representing the constructed and updated announcement to be sent to some neighbor
+        """
+        if type == "update":
+            return self.construct_update(announcement, network)
+        elif type == "revocation": 
+            return self.construct_revocation(announcement, network)
+        else:
+            return self.construct_no_route(announcement, network)            
+
+    def forward(self, message, srcif, isAllNeighbors = False, type = "update"):
+        """
+        Forwards the received message to the neigbors, based on the relationship. 
+        If the neigbor is not the src of the message, and either the relationship with the neighbor
+        is a customer or the message should be forwarded to all neigbors, then we construct the 
+        updated message, and send it to the appropriate neighbor. 
+
+        Args:
+            message(dictionary) -> represents the announcement received by "srcif", a neighbor.
+            srcif(string) -> the IP address of the src of the announcement, one of the neighbors.
+            isAllNeigbors(bool): Optional -> whether the message should be forwarded to all neighbors, 
+                typically when the source is a neighbor
+            type(string) -> the type of announcement that should be forwarded (one of "update", "revocation" or "no route")
+        """
+        for sock in self.sockets:
+            if srcif != sock and (isAllNeighbors or self.relations[sock] == "cust"):
+                self.send(sock, self.construct(message, sock, type))
+
+    def remove_route(self, message):
+        """
+        Upon receiving a withdraw announcement, this function is called and removes the matching route from the 
+        unaggregated forwarding table, in order to rebuild the aggregated forwarding table from a valid list of routes.
+        Note: a match is determined based on the "src", the "network" and the "netmask"
+
+        Args:
+            message(dictionary) -> the revocation announcement received from one of the neighbors
+        """
+        for net in message["msg"]:
+            i = 0
+            while i < len(self.unaggregated_table):
+                if self.unaggregated_table[i]["src"] == message["src"] and \
+                    net["network"] == self.unaggregated_table[i]["msg"]["network"] and\
+                        net["netmask"] == self.unaggregated_table[i]["msg"]["netmask"]:
+
+                            del self.unaggregated_table[i]
+                            break
+                else: i += 1
+
+    def updateOrWithdraw(self, message, srcif, type = "update"):
+        """
+        Forwards the update or withdraw announcement received from "srcif" neighbor, based on the relationship.
+        If the type is "update", then we add the route to the unaggregated_table, and then try to aggregate it.
+        Otherwise, we assume the type is "revocation", remove the revocated route from the unaggregated_table, 
+        and reaggregate the aggregated forwarding table. 
+        Note: if the relation with "srcif" is "cust", then we forward the announcement to all neighbors!
+
+        Args:
+            message(dictionary) -> represents the announcement received by srcif, can be an update or a revocation  
+            srcif(string) -> IP address of the src of the announcement, one of the neighbors
+            type(string): Optional -> whether the type of announcement is a "update" or "revocation"
+        """
+        relation = self.relations[srcif]
+        if type == "update":
+            self.unaggregated_table.append(message)
+            deepCopy = copy.deepcopy(message)
+            result = self.aggregate(deepCopy)
+            if not result:
+                self.aggregated_table.append(deepCopy)
+        else:
+            self.remove_route(message)
+            self.reaggregate()
+        if relation == "cust":
+            self.forward(message, srcif, True, type)
+        else:
+            self.forward(message, srcif, False, type)
+
+    def dump_helper(self):
+        """
+        Returns the list of routes found in the aggregated forwarding table, reformatted for the table dump request.
+
+        Returns:
+            list<dictionary> -> represents the different routes found in the aggregated forwarding table.
+        """
+        listOfRoutes = []
+        for route in self.aggregated_table:
+            listOfRoutes.append({
+                "network" : route["msg"]["network"],
+                "netmask" : route["msg"]["netmask"],
+                "peer" : route["src"],
+                "localpref": route["msg"]["localpref"],
+                "ASPath": route["msg"]["ASPath"],
+                "selfOrigin": route["msg"]["selfOrigin"],
+                "origin": route["msg"]["origin"]})
+        return listOfRoutes
+
+    def dump_table(self, message, srcif):
+        """
+        Sends the dump of the aggregated forwarding table to the "srcif" neighbor. 
+        
+        Args:
+            message(dictionary) -> represents the dump request received by "srcif"
+            srcif(string) -> represents the IP address of the source of the dump request, one of the neigbors.
+        """
+        dump = {
+            "src":  message["dst"],
+            "dst":  message["src"],
+            "type": "table",                
+            "msg": self.dump_helper()
+        }
+        self.send(srcif, json.dumps(dump))
+
+    def process_message(self, message, srcif):
+        """
+        Processes and forwards/responds to the various types of messages that could be received by "srcif".
+        
+        Args:
+            message(dictionary) -> the announcement/request received by "srcif"
+            srcif(string) -> IP address of the source of the message, one of the neighbors
+        
+        Exception:
+            Throws an Exception if the type of the message is unsupported (not one of: update/withdraw/data/dump)
+        """
+        theType = message["type"]
+        if theType == "update":
+            self.updateOrWithdraw(message, srcif)
+        elif theType == "withdraw":
+            self.updateOrWithdraw(message, srcif, "revocation")
+        elif theType == "data":
+            self.forward_data(message, srcif)
+        elif theType == "dump":
+            self.dump_table(message, srcif)
+        else: 
+            raise Exception("Unsupported message type!")
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = k.decode('utf-8')
+                self.process_message(json.loads(msg), srcif)
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()

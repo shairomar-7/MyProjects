@@ -1,0 +1,14 @@
+---
+:id: 144752509
+:submitters:
+- :name: Alexander Naishuler
+  :email: naishuler.a@northeastern.edu
+- :name: Omar Shair
+  :email: shair.o@northeastern.edu
+:created_at: !ruby/object:ActiveSupport::TimeWithZone
+  utc: 2022-10-28 20:41:21.537152000 Z
+  zone: !ruby/object:ActiveSupport::TimeZone
+    name: America/Los_Angeles
+  time: 2022-10-28 13:41:21.537152000 Z
+:status: processed
+:score: 98.0
